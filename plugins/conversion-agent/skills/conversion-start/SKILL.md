@@ -15,6 +15,11 @@ Esta skill é o **atalho de entrada** do Conversion Agent. Ao ser invocada, voc�
 
 ## Roteamento direto para otimização on-page
 
+Se o pedido for uma “pré-análise de página e termo”, “checagem de
+canibalização” ou validação de keyword e URL no histórico, invoque diretamente
+`/conversion-agent:pre-analise-pagina-termo` e pare. Essa consulta é
+independente e não inicia a otimização.
+
 Se o pedido contiver "otimizar página", "on-page", "redline de URL" ou
 "melhorar página existente", invoque diretamente
 `/conversion-agent:otimizar-pagina` e pare. Não reproduza aqui a metodologia

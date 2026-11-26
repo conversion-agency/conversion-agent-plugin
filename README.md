@@ -44,7 +44,7 @@ node --version
 Dentro do Claude Code:
 
 ```
-/plugin marketplace add agencia-conversion/conversion-agent-plugin
+/plugin marketplace add conversion-agency/conversion-agent-plugin
 /plugin install conversion-agent@conversion-agent
 /reload-plugins
 ```
@@ -106,7 +106,7 @@ Baixe o instalador `.exe` em https://claude.com/code.
 Idêntico ao Mac:
 
 ```
-/plugin marketplace add agencia-conversion/conversion-agent-plugin
+/plugin marketplace add conversion-agency/conversion-agent-plugin
 /plugin install conversion-agent@conversion-agent
 /reload-plugins
 ```
@@ -196,7 +196,7 @@ do marketplace:
 
 ```
 /plugin marketplace remove conversion-agent
-/plugin marketplace add agencia-conversion/conversion-agent-plugin
+/plugin marketplace add conversion-agency/conversion-agent-plugin
 /plugin install conversion-agent@conversion-agent
 ```
 

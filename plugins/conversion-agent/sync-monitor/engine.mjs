@@ -170,6 +170,16 @@ export async function reconcileSyncProject(input) {
             };
         }
         if (plan.status === "clean") {
+            if (manifest.commitId !== remoteCommitId || manifest.treeHash !== remoteTreeHash) {
+                await writeManifest(input.projectRoot, buildManifest({
+                    previous: manifest,
+                    commitId: remoteCommitId,
+                    treeHash: remoteTreeHash,
+                    nextTree: remoteTree,
+                    local,
+                    remoteMeta: {},
+                }));
+            }
             await writeSyncStatus(input.projectRoot, {
                 mode,
                 paused: false,
@@ -343,45 +353,72 @@ async function uploadLocalChanges(input) {
     }
 }
 async function pushCommit(input) {
-    const clientCommitId = deterministicCommitId({
-        projectId: input.project.proj_id,
-        actorUserId: input.auth.email,
-        syncClientId: "plugin-sync-monitor",
-        parentCommitId: input.parentCommitId,
-        parentTreeHash: input.parentTreeHash,
-        treeHash: input.treeHash,
-        message: input.message,
-    });
-    const response = await authedFetch(input.auth, `/api/v1/ws/${input.project.ws_id}/projects/${input.project.proj_id}/commits`, {
-        method: "POST",
-        headers: { "content-type": "application/json", accept: "application/json" },
-        body: JSON.stringify({
-            parent_tree_hash: input.parentTreeHash,
-            parent_commit_id: input.parentCommitId,
-            client_commit_id: clientCommitId,
-            tree: input.tree,
+    let parentCommitId = input.parentCommitId;
+    let parentTreeHash = input.parentTreeHash;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        const clientCommitId = deterministicCommitId({
+            projectId: input.project.proj_id,
+            actorUserId: input.auth.email,
+            syncClientId: "plugin-sync-monitor",
+            parentCommitId,
+            parentTreeHash,
+            treeHash: input.treeHash,
             message: input.message,
-        }),
-    });
-    const text = await response.text();
-    if (response.status === 409) {
-        let serverHead;
-        try {
-            serverHead = JSON.parse(text).server_head;
+        });
+        const response = await authedFetch(input.auth, `/api/v1/ws/${input.project.ws_id}/projects/${input.project.proj_id}/commits`, {
+            method: "POST",
+            headers: {
+                "content-type": "application/json",
+                accept: "application/json",
+                "x-conversion-client": "plugin-sync-monitor",
+            },
+            body: JSON.stringify({
+                parent_tree_hash: parentTreeHash,
+                parent_commit_id: parentCommitId,
+                client_commit_id: clientCommitId,
+                tree: input.tree,
+                message: input.message,
+            }),
+        });
+        const text = await response.text();
+        if (response.status === 409) {
+            let serverHead;
+            try {
+                const candidate = JSON.parse(text).server_head;
+                if (candidate &&
+                    typeof candidate === "object" &&
+                    typeof candidate.commitId === "string" &&
+                    typeof candidate.treeHash === "string") {
+                    serverHead = candidate;
+                }
+            }
+            catch {
+                serverHead = undefined;
+            }
+            if (serverHead?.treeHash === input.treeHash) {
+                return {
+                    status: "ok",
+                    commitId: serverHead.commitId,
+                    treeHash: serverHead.treeHash,
+                };
+            }
+            if (attempt === 0 && serverHead?.treeHash === input.parentTreeHash) {
+                parentCommitId = serverHead.commitId;
+                parentTreeHash = serverHead.treeHash;
+                continue;
+            }
+            return { status: "conflict", serverHead };
         }
-        catch {
-            serverHead = undefined;
-        }
-        return { status: "conflict", serverHead };
+        if (!response.ok)
+            throw new Error(`commit_http_${response.status}:${text.slice(0, 200)}`);
+        const body = JSON.parse(text);
+        const commitId = body.commit?.id;
+        const treeHash = body.commit?.treeHash;
+        if (!commitId || !treeHash)
+            throw new Error("commit_response_invalid");
+        return { status: "ok", commitId, treeHash };
     }
-    if (!response.ok)
-        throw new Error(`commit_http_${response.status}:${text.slice(0, 200)}`);
-    const body = JSON.parse(text);
-    const commitId = body.commit?.id;
-    const treeHash = body.commit?.treeHash;
-    if (!commitId || !treeHash)
-        throw new Error("commit_response_invalid");
-    return { status: "ok", commitId, treeHash };
+    return { status: "conflict" };
 }
 async function applyRemoteToDisk(input) {
     const remoteMeta = {};

@@ -97689,7 +97689,10 @@ var LEGACY_PROJECT_TOOL_NAMES = /* @__PURE__ */ new Set([
 var SEARCHHUB_PROJECT_TOOL_NAMES = new Set(
   [...LEGACY_PROJECT_TOOL_NAMES].map((name) => `searchhub_${name}`)
 );
-var SEARCHHUB_ONLY_TOOL_NAMES = /* @__PURE__ */ new Set(["searchhub_create_project"]);
+var SEARCHHUB_ONLY_TOOL_NAMES = /* @__PURE__ */ new Set([
+  "searchhub_create_project",
+  "pre_analyze_page_term"
+]);
 function isToolEnabled(name, mode) {
   if (LEGACY_PROJECT_TOOL_NAMES.has(name)) return true;
   if (SEARCHHUB_PROJECT_TOOL_NAMES.has(name)) return mode !== "legacy";
@@ -99419,7 +99422,7 @@ async function failedResponse(response, operation) {
 function isValidCommitResponse(value) {
   if (!isPlainRecord(value) || !isPlainRecord(value.commit)) return false;
   const commit = value.commit;
-  return typeof commit.id === "string" && commit.id.length > 0 && typeof commit.treeHash === "string" && SHA256_PATTERN.test(commit.treeHash) && (commit.parentId === null || typeof commit.parentId === "string") && typeof commit.createdAt === "string" && commit.createdAt.length > 0 && (value.idempotent === void 0 || typeof value.idempotent === "boolean");
+  return typeof commit.id === "string" && commit.id.length > 0 && typeof commit.treeHash === "string" && SHA256_PATTERN.test(commit.treeHash) && (commit.parentId === null || typeof commit.parentId === "string") && typeof commit.createdAt === "string" && commit.createdAt.length > 0 && (value.idempotent === void 0 || typeof value.idempotent === "boolean") && (value.unchanged === void 0 || typeof value.unchanged === "boolean");
 }
 function transactionFileName(index2, identity, kind) {
   const encoded = Buffer.from(identity, "utf8").toString("base64url").slice(0, 48);
@@ -99610,77 +99613,98 @@ async function commitProjectFilesWhileLocked(input, context, validation) {
   }
   for (const file2 of processed) tree[file2.path] = file2.sha256;
   const treeHash = sha256Hex(Buffer.from(canonicalTreeJson(tree), "utf8"));
-  const parentTreeHash = manifest.commitId ? manifest.treeHash : null;
-  const clientCommitId = deterministicCommitId({
-    projectId: manifest.projectId,
-    actorUserId: credential.email,
-    syncClientId: input.syncClientId,
-    parentCommitId: manifest.commitId,
-    parentTreeHash,
-    treeHash,
-    message: input.message ?? null
-  });
-  const commitBody = {
-    parent_tree_hash: parentTreeHash,
-    parent_commit_id: manifest.commitId ?? null,
-    client_commit_id: clientCommitId,
-    tree,
-    ...input.message ? { message: input.message } : {}
-  };
-  let commitResponse;
-  try {
-    commitResponse = await authedFetch(
-      credential,
-      `${backendUrl}/api/v1/ws/${context.wsId}/projects/${context.projId}/commits`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(commitBody)
-      }
-    );
-  } catch (error48) {
-    return {
-      ok: false,
-      error: "network_error",
-      hint: error48 instanceof Error ? error48.message : String(error48)
-    };
-  }
-  if (commitResponse.status === 409) {
-    let serverHead = null;
+  let parentCommitId = manifest.commitId ?? null;
+  let parentTreeHash = manifest.commitId ? manifest.treeHash : null;
+  let commit = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const clientCommitId = deterministicCommitId({
+      projectId: manifest.projectId,
+      actorUserId: credential.email,
+      syncClientId: input.syncClientId,
+      parentCommitId,
+      parentTreeHash,
+      treeHash,
+      message: input.message ?? null
+    });
+    let commitResponse;
     try {
-      const conflict = await commitResponse.json();
-      serverHead = conflict.server_head ?? null;
-    } catch {
+      commitResponse = await authedFetch(
+        credential,
+        `${backendUrl}/api/v1/ws/${context.wsId}/projects/${context.projId}/commits`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-conversion-client": "mcp-project-save"
+          },
+          body: JSON.stringify({
+            parent_tree_hash: parentTreeHash,
+            parent_commit_id: parentCommitId,
+            client_commit_id: clientCommitId,
+            tree,
+            ...input.message ? { message: input.message } : {}
+          })
+        }
+      );
+    } catch (error48) {
+      return {
+        ok: false,
+        error: "network_error",
+        hint: error48 instanceof Error ? error48.message : String(error48)
+      };
     }
-    return {
-      ok: false,
-      error: "conflict",
-      hint: manifestConflictHint(context.backendTarget),
-      server_head: serverHead
-    };
+    if (commitResponse.status === 409) {
+      let serverHead = null;
+      try {
+        const conflict = await commitResponse.json();
+        serverHead = conflict.server_head ?? null;
+      } catch {
+      }
+      if (serverHead?.treeHash === treeHash) {
+        commit = { id: serverHead.commitId, treeHash: serverHead.treeHash };
+        break;
+      }
+      if (attempt === 0 && serverHead?.treeHash === manifest.treeHash) {
+        parentCommitId = serverHead.commitId;
+        parentTreeHash = serverHead.treeHash;
+        continue;
+      }
+      return {
+        ok: false,
+        error: "conflict",
+        hint: manifestConflictHint(context.backendTarget),
+        server_head: serverHead
+      };
+    }
+    if (commitResponse.status !== 201 && commitResponse.status !== 200) {
+      return failedResponse(commitResponse, "Commit");
+    }
+    let parsedCommit;
+    try {
+      parsedCommit = await commitResponse.json();
+    } catch (error48) {
+      return backendError(error48 instanceof Error ? error48.message : String(error48));
+    }
+    if (!isValidCommitResponse(parsedCommit)) {
+      return backendError("Commit response is malformed.");
+    }
+    const isIdempotent = parsedCommit.idempotent === true;
+    const isUnchanged = parsedCommit.unchanged === true;
+    if (commitResponse.status === 200 && isIdempotent === isUnchanged) {
+      return backendError("HTTP 200 commit response must be marked idempotent or unchanged.");
+    }
+    if (treeHash !== parsedCommit.commit.treeHash) {
+      return backendError(
+        `Commit tree hash mismatch: local=${treeHash} server=${parsedCommit.commit.treeHash}`
+      );
+    }
+    if (commitResponse.status === 200 && isIdempotent && (parsedCommit.commit.id !== clientCommitId || parsedCommit.commit.parentId !== parentCommitId)) {
+      return backendError("Idempotent commit response does not match the requested commit identity.");
+    }
+    commit = { id: parsedCommit.commit.id, treeHash: parsedCommit.commit.treeHash };
+    break;
   }
-  if (commitResponse.status !== 201 && commitResponse.status !== 200) {
-    return failedResponse(commitResponse, "Commit");
-  }
-  let parsedCommit;
-  try {
-    parsedCommit = await commitResponse.json();
-  } catch (error48) {
-    return backendError(error48 instanceof Error ? error48.message : String(error48));
-  }
-  if (!isValidCommitResponse(parsedCommit)) {
-    return backendError("Commit response is malformed.");
-  }
-  if (commitResponse.status === 200 && parsedCommit.idempotent !== true) {
-    return backendError("HTTP 200 commit response is not marked idempotent.");
-  }
-  const commit = parsedCommit.commit;
-  if (treeHash !== commit.treeHash) {
-    return backendError(`Commit tree hash mismatch: local=${treeHash} server=${commit.treeHash}`);
-  }
-  if (commitResponse.status === 200 && (commit.id !== clientCommitId || commit.parentId !== (manifest.commitId ?? null))) {
-    return backendError("Idempotent commit response does not match the requested commit identity.");
-  }
+  if (!commit) return backendError("Commit retry completed without a server result.");
   const nextFiles = { ...manifest.files };
   for (const file2 of processed) {
     nextFiles[file2.path] = {
@@ -100014,70 +100038,100 @@ async function runProjectSaveBatch(input, cwd = process.cwd(), target2 = {}) {
       nextTree[p.path] = p.sha;
     }
     const nextTreeHash = sha256Hex(Buffer.from(canonicalTreeJson(nextTree), "utf8"));
-    const batchBody = {
-      parent_tree_hash: manifest.commitId ? manifest.treeHash : null,
-      parent_commit_id: manifest.commitId ?? null,
-      client_commit_id: deterministicCommitId({
+    let parentCommitId = manifest.commitId ?? null;
+    let parentTreeHash = manifest.commitId ? manifest.treeHash : null;
+    let commit = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const clientCommitId = deterministicCommitId({
         projectId: manifest.projectId,
         actorUserId: cred.email,
         syncClientId: "mcp-project-save-batch",
-        parentCommitId: manifest.commitId,
-        parentTreeHash: manifest.commitId ? manifest.treeHash : null,
+        parentCommitId,
+        parentTreeHash,
         treeHash: nextTreeHash,
         message: input.message ?? null
-      }),
-      files: input.files.map((f2) => ({ path: f2.path, content: f2.content })),
-      ...input.message ? { message: input.message } : {}
-    };
-    let res;
-    try {
-      res = await authedFetch2(
-        cred,
-        `${backendUrl}/api/v1/ws/${scope.ws_id}/projects/${scope.proj_id}/commits/batch`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(batchBody)
-        }
-      );
-    } catch (err2) {
-      return {
-        ok: false,
-        error: "network_error",
-        hint: err2 instanceof Error ? err2.message : String(err2)
-      };
-    }
-    if (res.status === 409) {
-      let serverHead = null;
+      });
+      let res;
       try {
-        const body = await res.json();
-        serverHead = body.server_head ?? null;
-      } catch {
+        res = await authedFetch2(
+          cred,
+          `${backendUrl}/api/v1/ws/${scope.ws_id}/projects/${scope.proj_id}/commits/batch`,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-conversion-client": "mcp-project-save-batch"
+            },
+            body: JSON.stringify({
+              parent_tree_hash: parentTreeHash,
+              parent_commit_id: parentCommitId,
+              client_commit_id: clientCommitId,
+              files: input.files.map((f2) => ({ path: f2.path, content: f2.content })),
+              ...input.message ? { message: input.message } : {}
+            })
+          }
+        );
+      } catch (err2) {
+        return {
+          ok: false,
+          error: "network_error",
+          hint: err2 instanceof Error ? err2.message : String(err2)
+        };
       }
-      return {
-        ok: false,
-        error: "conflict",
-        hint: `Project head moved; use the \`${materializeTool2}\` MCP tool and retry.`,
-        server_head: serverHead
-      };
+      if (res.status === 409) {
+        let serverHead = null;
+        try {
+          const body = await res.json();
+          serverHead = body.server_head ?? null;
+        } catch {
+        }
+        if (serverHead?.treeHash === nextTreeHash) {
+          commit = { id: serverHead.commitId, treeHash: serverHead.treeHash };
+          break;
+        }
+        if (attempt === 0 && serverHead?.treeHash === manifest.treeHash) {
+          parentCommitId = serverHead.commitId;
+          parentTreeHash = serverHead.treeHash;
+          continue;
+        }
+        return {
+          ok: false,
+          error: "conflict",
+          hint: `Project head moved; use the \`${materializeTool2}\` MCP tool and retry.`,
+          server_head: serverHead
+        };
+      }
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        return {
+          ok: false,
+          error: "backend_error",
+          hint: `Commit batch failed (HTTP ${res.status}): ${text.slice(0, 200)}`
+        };
+      }
+      try {
+        const parsed = await res.json();
+        if (!parsed.commit?.id || !parsed.commit.treeHash) {
+          throw new Error("Commit batch response is malformed.");
+        }
+        if (res.status === 200 && parsed.idempotent === true === (parsed.unchanged === true)) {
+          throw new Error("HTTP 200 commit response must be marked idempotent or unchanged.");
+        }
+        commit = { id: parsed.commit.id, treeHash: parsed.commit.treeHash };
+        break;
+      } catch (err2) {
+        return {
+          ok: false,
+          error: "backend_error",
+          hint: err2 instanceof Error ? err2.message : String(err2)
+        };
+      }
     }
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
+    if (!commit) {
       return {
         ok: false,
         error: "backend_error",
-        hint: `Commit batch failed (HTTP ${res.status}): ${text.slice(0, 200)}`
-      };
-    }
-    let commit;
-    try {
-      const parsed = await res.json();
-      commit = parsed.commit;
-    } catch (err2) {
-      return {
-        ok: false,
-        error: "backend_error",
-        hint: err2 instanceof Error ? err2.message : String(err2)
+        hint: "Commit batch retry completed without a server result."
       };
     }
     try {
@@ -100135,6 +100189,115 @@ async function runProjectSaveBatch(input, cwd = process.cwd(), target2 = {}) {
 `
       );
     }
+  }
+}
+
+// src/tools/pre-analyze-page-term.ts
+var PRE_ANALYZE_PAGE_TERM_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    ...PROJECT_SCOPE_SCHEMA_FRAGMENT,
+    keyword: {
+      type: "string",
+      minLength: 1,
+      description: "Keyword principal a validar no hist\xF3rico de QuickWins."
+    },
+    url: {
+      type: ["string", "null"],
+      minLength: 1,
+      format: "uri",
+      description: "URL HTTP(S) da p\xE1gina existente. Omita ou envie null ao analisar a cria\xE7\xE3o de uma p\xE1gina."
+    }
+  },
+  required: ["ws_slug", "proj_slug", "keyword"],
+  additionalProperties: false
+};
+function isPlainRecord2(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+var INPUT_KEYS = /* @__PURE__ */ new Set(["ws_slug", "proj_slug", "keyword", "url"]);
+function hasNormalizedKeyword(value) {
+  return value.normalize("NFKD").replace(new RegExp("\\p{M}", "gu"), "").trim().length > 0;
+}
+function normalizedInput(input) {
+  if (!isPlainRecord2(input) || Object.keys(input).some((key) => !INPUT_KEYS.has(key))) {
+    return { ok: false, error: "bad_input" };
+  }
+  if (typeof input.ws_slug !== "string" || input.ws_slug.length === 0 || typeof input.proj_slug !== "string" || input.proj_slug.length === 0 || typeof input.keyword !== "string" || !hasNormalizedKeyword(input.keyword)) {
+    return { ok: false, error: "bad_input" };
+  }
+  let url2 = null;
+  if (input.url !== void 0 && input.url !== null) {
+    if (typeof input.url !== "string" || input.url.trim().length === 0) {
+      return { ok: false, error: "bad_input" };
+    }
+    try {
+      const trimmed = input.url.trim();
+      if (!/^https?:\/\//iu.test(trimmed)) {
+        return { ok: false, error: "bad_input" };
+      }
+      const parsed = new URL(trimmed);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        return { ok: false, error: "bad_input" };
+      }
+      url2 = input.url.trim();
+    } catch {
+      return { ok: false, error: "bad_input" };
+    }
+  }
+  return {
+    ws_slug: input.ws_slug,
+    proj_slug: input.proj_slug,
+    keyword: input.keyword.trim(),
+    url: url2
+  };
+}
+function mapError4(error48) {
+  if (error48 instanceof NotAuthenticatedError) {
+    return { ok: false, error: "not_authenticated" };
+  }
+  if (error48 instanceof SessionExpiredError) {
+    return { ok: false, error: "session_expired" };
+  }
+  if (error48 instanceof RateLimitedError) {
+    return {
+      ok: false,
+      error: "rate_limited",
+      retry_after_sec: error48.retryAfterSec
+    };
+  }
+  if (error48 instanceof NetworkError) return { ok: false, error: "network_error" };
+  if (error48 instanceof BackendError || error48 instanceof SkillNotFoundError) {
+    return { ok: false, error: "backend_error" };
+  }
+  return { ok: false, error: "backend_error" };
+}
+async function runPreAnalyzePageTerm(rawInput, cwd = process.cwd()) {
+  const input = normalizedInput(rawInput);
+  if ("ok" in input) return input;
+  const scope = await resolveProjectScope(
+    input,
+    cwd,
+    SEARCHHUB_HUB_FILE,
+    "searchhub_materialize_project"
+  );
+  if (!scope.ok) return { ok: false, error: scope.error, hint: scope.hint };
+  try {
+    const result = await authenticatedJson(
+      "/api/v1/pre-analysis/page-term",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          wsId: scope.ws_id,
+          projectId: scope.proj_id,
+          keyword: input.keyword,
+          url: input.url ?? null
+        })
+      }
+    );
+    return { ok: true, ...result };
+  } catch (error48) {
+    return mapError4(error48);
   }
 }
 
@@ -103735,6 +103898,55 @@ var OnPageOptimizationFrontmatterSchema = external_exports3.discriminatedUnion("
   }
 });
 
+// ../../shared/dist/collections/page-term-pre-analysis.js
+var PAGE_TERM_PRE_ANALYSIS_TYPE = "pre_analise_pagina_termo";
+var PAGE_TERM_PRE_ANALYSIS_CONVENTIONAL_PATH = "pesquisas/pre-analises/";
+var PAGE_TERM_PRE_ANALYSIS_SOURCE = "bigquery:iconic-rampart-279113.SearchHub.quickwins";
+var PageTermPreAnalysisModeSchema = external_exports3.enum(["criar", "otimizar"]);
+var PageTermPreAnalysisVerdictSchema = external_exports3.enum([
+  "livre",
+  "atencao",
+  "conflito",
+  "inconclusivo"
+]);
+var PageTermPreAnalysisCountsSchema = external_exports3.object({
+  total: external_exports3.number().int().nonnegative(),
+  conflito: external_exports3.number().int().nonnegative(),
+  atencao: external_exports3.number().int().nonnegative(),
+  informativo: external_exports3.number().int().nonnegative()
+}).strict().refine((counts) => counts.total === counts.conflito + counts.atencao + counts.informativo, { message: "counts.total must equal the sum of severity counts" });
+var PageTermPreAnalysisFrontmatterSchema = external_exports3.object({
+  type: external_exports3.literal(PAGE_TERM_PRE_ANALYSIS_TYPE),
+  mode: PageTermPreAnalysisModeSchema,
+  verdict: PageTermPreAnalysisVerdictSchema,
+  keyword: external_exports3.string().trim().min(1),
+  url: external_exports3.url().refine((value) => /^https?:\/\//iu.test(value)).optional(),
+  normalized_keyword: external_exports3.string().trim().min(1),
+  normalized_url: external_exports3.string().trim().min(1).optional(),
+  queried_at: IsoDateTimeSchema,
+  source_last_modified_at: IsoDateTimeSchema.nullable(),
+  source: external_exports3.literal(PAGE_TERM_PRE_ANALYSIS_SOURCE),
+  truncated: external_exports3.boolean(),
+  counts: PageTermPreAnalysisCountsSchema
+}).strict().superRefine((value, context) => {
+  const hasUrl = value.url !== void 0;
+  const hasNormalizedUrl = value.normalized_url !== void 0;
+  if (value.mode === "otimizar" && (!hasUrl || !hasNormalizedUrl)) {
+    context.addIssue({
+      code: "custom",
+      path: ["url"],
+      message: "optimization mode requires url and normalized_url"
+    });
+  }
+  if (value.mode === "criar" && (hasUrl || hasNormalizedUrl)) {
+    context.addIssue({
+      code: "custom",
+      path: ["url"],
+      message: "create mode must omit url and normalized_url"
+    });
+  }
+});
+
 // ../../shared/dist/collections/index.js
 var COLLECTION_REGISTRY = {
   [ARTIGO_TYPE]: {
@@ -103776,6 +103988,10 @@ var COLLECTION_REGISTRY = {
   [ON_PAGE_OPTIMIZATION_TYPE]: {
     schema: OnPageOptimizationFrontmatterSchema,
     conventional_path: ON_PAGE_OPTIMIZATION_CONVENTIONAL_PATH
+  },
+  [PAGE_TERM_PRE_ANALYSIS_TYPE]: {
+    schema: PageTermPreAnalysisFrontmatterSchema,
+    conventional_path: PAGE_TERM_PRE_ANALYSIS_CONVENTIONAL_PATH
   },
   [BRAIN_TOM_VOZ_TYPE]: {
     schema: BrainTomVozFrontmatterSchema,
@@ -124383,13 +124599,13 @@ var PACKAGE_ON_PAGE_OPTIMIZATION_INPUT_SCHEMA = {
   required: ["ws_slug", "proj_slug", "run_slug"],
   additionalProperties: false
 };
-var INPUT_KEYS = /* @__PURE__ */ new Set(["ws_slug", "proj_slug", "run_slug"]);
-function isPlainRecord2(value) {
+var INPUT_KEYS2 = /* @__PURE__ */ new Set(["ws_slug", "proj_slug", "run_slug"]);
+function isPlainRecord3(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 function validateInput2(input) {
-  if (!isPlainRecord2(input)) return { ok: false, error: "bad_input" };
-  if (Object.keys(input).some((key) => !INPUT_KEYS.has(key))) {
+  if (!isPlainRecord3(input)) return { ok: false, error: "bad_input" };
+  if (Object.keys(input).some((key) => !INPUT_KEYS2.has(key))) {
     return { ok: false, error: "bad_input" };
   }
   if (!isValidOnPageRunSlug(input.run_slug)) {
@@ -124907,10 +125123,10 @@ async function runReadBrain(input, cwd = process.cwd(), target2 = {}) {
     const items = typeof input.collection === "string" ? body.items.filter((i) => i.type === input.collection) : body.items;
     return { ok: true, items };
   } catch (err2) {
-    return mapError4(err2);
+    return mapError5(err2);
   }
 }
-function mapError4(err2) {
+function mapError5(err2) {
   if (err2 instanceof NotAuthenticatedError) {
     return {
       ok: false,
@@ -125222,10 +125438,10 @@ async function runSearchHubCreateProject(input, backendUrl = requireSearchHubBac
       workspace: { id: workspace.id, slug: workspace.slug }
     };
   } catch (err2) {
-    return mapError5(err2, client);
+    return mapError6(err2, client);
   }
 }
-function mapError5(err2, client) {
+function mapError6(err2, client) {
   if (err2 instanceof SkillNotFoundError) {
     return {
       ok: false,
@@ -125353,10 +125569,10 @@ async function runSearchProject(input, cwd = process.cwd(), target2 = {}) {
     const body = target2.backendUrl ? await authenticatedJsonAt(target2.backendUrl, path, { method: "GET" }) : await authenticatedJson(path, { method: "GET" });
     return { ok: true, items: body.items, total: body.total };
   } catch (err2) {
-    return mapError6(err2);
+    return mapError7(err2);
   }
 }
-function mapError6(err2) {
+function mapError7(err2) {
   if (err2 instanceof NotAuthenticatedError) {
     return {
       ok: false,
@@ -126375,6 +126591,11 @@ function buildServer() {
         inputSchema: PROJECT_SAVE_BATCH_INPUT_SCHEMA
       },
       {
+        name: "pre_analyze_page_term",
+        description: "Checks the authorized client's QuickWins history for an exact normalized keyword and optional URL before creating or optimizing a page. Returns livre, atencao, conflito, or inconclusivo and never writes to BigQuery.",
+        inputSchema: PRE_ANALYZE_PAGE_TERM_INPUT_SCHEMA
+      },
+      {
         name: "package_on_page_optimization",
         description: "Validates and packages an approved on-page optimization run from canonical project files, then commits all generated artifacts atomically. It reads only ws_slug, proj_slug and run_slug and cannot accept arbitrary content or bytes.",
         inputSchema: PACKAGE_ON_PAGE_OPTIMIZATION_INPUT_SCHEMA
@@ -126541,6 +126762,12 @@ function buildServer() {
         break;
       case "project_save_batch":
         result = await runProjectSaveBatch(safeArgs);
+        break;
+      case "pre_analyze_page_term":
+        result = await runPreAnalyzePageTerm(
+          safeArgs,
+          process.cwd()
+        );
         break;
       case "package_on_page_optimization":
         result = await runPackageOnPageOptimization(
