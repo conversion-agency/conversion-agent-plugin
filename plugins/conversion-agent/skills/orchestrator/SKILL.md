@@ -354,7 +354,7 @@ No modo direto, execute ponta a ponta e entregue relatório consolidado.
 ## Interações diretas (sem skill)
 
 ### A. "Atualize / instale o plugin"
-`/plugin` → Marketplaces → `conversion-agent` → **Enable auto-update**. Forçar agora: `/plugin marketplace remove conversion-agent && /plugin marketplace add agencia-conversion/conversion-agent-plugin`.
+`/plugin` → Marketplaces → `conversion-agent` → **Enable auto-update**. Forçar agora: `/plugin marketplace remove conversion-agent && /plugin marketplace add conversion-agency/conversion-agent-plugin`.
 
 ### B. "Atualize o playbook / CLAUDE.md"
 Não há arquivo pra atualizar à mão: o playbook é a skill `/conversion-agent:orchestrator`, sempre sincronizada com o backend pelo plugin. Garanta o auto-update do plugin (item A).
