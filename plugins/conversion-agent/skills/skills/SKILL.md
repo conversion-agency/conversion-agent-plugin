@@ -40,6 +40,7 @@ Liste em prosa de consultor as skills agrupadas por propósito. Use a tabela aba
 ### Operacional
 
 - `/pre-analise-pagina-termo` — consulta o histórico de QuickWins para evitar canibalização; recebe `<keyword> [url]` e só salva após confirmação.
+- `/puxar-dados-qw` — puxa a tabela de um QuickWin por cliente + termo/URL ou de um pacote por cliente + mês de competência.
 - `/pull` — re-materializa project ativo.
 - `/status` — diff local vs backend.
 - `/buscar <termo>` — full-text no project.

@@ -97691,7 +97691,8 @@ var SEARCHHUB_PROJECT_TOOL_NAMES = new Set(
 );
 var SEARCHHUB_ONLY_TOOL_NAMES = /* @__PURE__ */ new Set([
   "searchhub_create_project",
-  "pre_analyze_page_term"
+  "pre_analyze_page_term",
+  "pull_quickwins"
 ]);
 function isToolEnabled(name, mode) {
   if (LEGACY_PROJECT_TOOL_NAMES.has(name)) return true;
@@ -100298,6 +100299,150 @@ async function runPreAnalyzePageTerm(rawInput, cwd = process.cwd()) {
     return { ok: true, ...result };
   } catch (error48) {
     return mapError4(error48);
+  }
+}
+
+// src/tools/pull-quickwins.ts
+var PULL_QUICKWINS_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    ...PROJECT_SCOPE_SCHEMA_FRAGMENT,
+    mode: {
+      type: "string",
+      enum: ["specific", "package"],
+      description: "specific busca por termo ou URL; package busca todos os QuickWins do m\xEAs de compet\xEAncia."
+    },
+    term: {
+      type: "string",
+      minLength: 1,
+      description: "Termo exato do QuickWin. Use somente no modo specific."
+    },
+    url: {
+      type: "string",
+      minLength: 1,
+      format: "uri",
+      description: "URL HTTP(S) exata do QuickWin. Use somente no modo specific."
+    },
+    competence_month: {
+      type: "string",
+      minLength: 4,
+      description: "M\xEAs do pacote em YYYY-MM, MM/YYYY ou abrevia\xE7\xE3o portuguesa como nov/26. Use somente no modo package."
+    }
+  },
+  required: ["ws_slug", "proj_slug", "mode"],
+  additionalProperties: false
+};
+var INPUT_KEYS2 = /* @__PURE__ */ new Set(["ws_slug", "proj_slug", "mode", "term", "url", "competence_month"]);
+var MONTH_NAMES = /* @__PURE__ */ new Set([
+  "jan",
+  "fev",
+  "mar",
+  "abr",
+  "mai",
+  "jun",
+  "jul",
+  "ago",
+  "set",
+  "out",
+  "nov",
+  "dez"
+]);
+function plainRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+function containsText(value) {
+  return value.normalize("NFKD").replace(new RegExp("\\p{M}", "gu"), "").trim().length > 0;
+}
+function validHttpUrl(value) {
+  try {
+    const trimmed = value.trim();
+    if (!/^https?:\/\//iu.test(trimmed)) return false;
+    const parsed = new URL(trimmed);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+function validCompetenceMonth(value) {
+  const normalized = value.trim().toLowerCase();
+  let match = /^(\d{4})-(\d{1,2})$/u.exec(normalized);
+  if (match) return Number(match[2]) >= 1 && Number(match[2]) <= 12;
+  match = /^(\d{1,2})\/(\d{4})$/u.exec(normalized);
+  if (match) return Number(match[1]) >= 1 && Number(match[1]) <= 12;
+  match = /^([a-z]{3})\/(\d{2}|\d{4})$/u.exec(normalized);
+  const monthName = match?.[1];
+  return Boolean(monthName && MONTH_NAMES.has(monthName));
+}
+function normalizedInput2(input) {
+  if (!plainRecord(input) || Object.keys(input).some((key) => !INPUT_KEYS2.has(key)) || typeof input.ws_slug !== "string" || input.ws_slug.length === 0 || typeof input.proj_slug !== "string" || input.proj_slug.length === 0) {
+    return { ok: false, error: "bad_input" };
+  }
+  if (input.mode === "specific") {
+    const hasTerm = typeof input.term === "string";
+    const hasUrl = typeof input.url === "string";
+    if (hasTerm === hasUrl || input.competence_month !== void 0 || hasTerm && !containsText(input.term) || hasUrl && !validHttpUrl(input.url)) {
+      return { ok: false, error: "bad_input" };
+    }
+    return {
+      ws_slug: input.ws_slug,
+      proj_slug: input.proj_slug,
+      mode: "specific",
+      ...hasTerm ? { term: input.term.trim() } : { url: input.url.trim() }
+    };
+  }
+  if (input.mode === "package" && typeof input.competence_month === "string" && input.term === void 0 && input.url === void 0 && validCompetenceMonth(input.competence_month)) {
+    return {
+      ws_slug: input.ws_slug,
+      proj_slug: input.proj_slug,
+      mode: "package",
+      competence_month: input.competence_month.trim()
+    };
+  }
+  return { ok: false, error: "bad_input" };
+}
+function mapError5(error48) {
+  if (error48 instanceof NotAuthenticatedError) {
+    return { ok: false, error: "not_authenticated" };
+  }
+  if (error48 instanceof SessionExpiredError) {
+    return { ok: false, error: "session_expired" };
+  }
+  if (error48 instanceof RateLimitedError) {
+    return {
+      ok: false,
+      error: "rate_limited",
+      retry_after_sec: error48.retryAfterSec
+    };
+  }
+  if (error48 instanceof NetworkError) return { ok: false, error: "network_error" };
+  if (error48 instanceof BackendError || error48 instanceof SkillNotFoundError) {
+    return { ok: false, error: "backend_error" };
+  }
+  return { ok: false, error: "backend_error" };
+}
+async function runPullQuickWins(rawInput, cwd = process.cwd()) {
+  const input = normalizedInput2(rawInput);
+  if ("ok" in input) return input;
+  const scope = await resolveProjectScope(
+    input,
+    cwd,
+    SEARCHHUB_HUB_FILE,
+    "searchhub_materialize_project"
+  );
+  if (!scope.ok) return { ok: false, error: scope.error, hint: scope.hint };
+  const selector = input.mode === "package" ? { mode: input.mode, competence_month: input.competence_month } : "term" in input ? { mode: input.mode, term: input.term } : { mode: input.mode, url: input.url };
+  try {
+    const result = await authenticatedJson("/api/v1/quickwins/pull", {
+      method: "POST",
+      body: JSON.stringify({
+        wsId: scope.ws_id,
+        projectId: scope.proj_id,
+        ...selector
+      })
+    });
+    return { ok: true, ...result };
+  } catch (error48) {
+    return mapError5(error48);
   }
 }
 
@@ -124599,13 +124744,13 @@ var PACKAGE_ON_PAGE_OPTIMIZATION_INPUT_SCHEMA = {
   required: ["ws_slug", "proj_slug", "run_slug"],
   additionalProperties: false
 };
-var INPUT_KEYS2 = /* @__PURE__ */ new Set(["ws_slug", "proj_slug", "run_slug"]);
+var INPUT_KEYS3 = /* @__PURE__ */ new Set(["ws_slug", "proj_slug", "run_slug"]);
 function isPlainRecord3(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 function validateInput2(input) {
   if (!isPlainRecord3(input)) return { ok: false, error: "bad_input" };
-  if (Object.keys(input).some((key) => !INPUT_KEYS2.has(key))) {
+  if (Object.keys(input).some((key) => !INPUT_KEYS3.has(key))) {
     return { ok: false, error: "bad_input" };
   }
   if (!isValidOnPageRunSlug(input.run_slug)) {
@@ -125123,10 +125268,10 @@ async function runReadBrain(input, cwd = process.cwd(), target2 = {}) {
     const items = typeof input.collection === "string" ? body.items.filter((i) => i.type === input.collection) : body.items;
     return { ok: true, items };
   } catch (err2) {
-    return mapError5(err2);
+    return mapError6(err2);
   }
 }
-function mapError5(err2) {
+function mapError6(err2) {
   if (err2 instanceof NotAuthenticatedError) {
     return {
       ok: false,
@@ -125438,10 +125583,10 @@ async function runSearchHubCreateProject(input, backendUrl = requireSearchHubBac
       workspace: { id: workspace.id, slug: workspace.slug }
     };
   } catch (err2) {
-    return mapError6(err2, client);
+    return mapError7(err2, client);
   }
 }
-function mapError6(err2, client) {
+function mapError7(err2, client) {
   if (err2 instanceof SkillNotFoundError) {
     return {
       ok: false,
@@ -125569,10 +125714,10 @@ async function runSearchProject(input, cwd = process.cwd(), target2 = {}) {
     const body = target2.backendUrl ? await authenticatedJsonAt(target2.backendUrl, path, { method: "GET" }) : await authenticatedJson(path, { method: "GET" });
     return { ok: true, items: body.items, total: body.total };
   } catch (err2) {
-    return mapError7(err2);
+    return mapError8(err2);
   }
 }
-function mapError7(err2) {
+function mapError8(err2) {
   if (err2 instanceof NotAuthenticatedError) {
     return {
       ok: false,
@@ -126596,6 +126741,11 @@ function buildServer() {
         inputSchema: PRE_ANALYZE_PAGE_TERM_INPUT_SCHEMA
       },
       {
+        name: "pull_quickwins",
+        description: "Pulls the authorized client's QuickWins as a read-only table. Use specific mode with an exact term or URL, or package mode with a competence month. BigQuery credentials remain backend-only.",
+        inputSchema: PULL_QUICKWINS_INPUT_SCHEMA
+      },
+      {
         name: "package_on_page_optimization",
         description: "Validates and packages an approved on-page optimization run from canonical project files, then commits all generated artifacts atomically. It reads only ws_slug, proj_slug and run_slug and cannot accept arbitrary content or bytes.",
         inputSchema: PACKAGE_ON_PAGE_OPTIMIZATION_INPUT_SCHEMA
@@ -126765,6 +126915,12 @@ function buildServer() {
         break;
       case "pre_analyze_page_term":
         result = await runPreAnalyzePageTerm(
+          safeArgs,
+          process.cwd()
+        );
+        break;
+      case "pull_quickwins":
+        result = await runPullQuickWins(
           safeArgs,
           process.cwd()
         );
